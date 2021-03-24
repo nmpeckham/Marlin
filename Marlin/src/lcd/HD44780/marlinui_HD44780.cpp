@@ -93,6 +93,10 @@
 
   LCD_CLASS lcd(0x27, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
 
+#elif ENABLED(YHCB2004)
+
+  LCD_CLASS lcd(YHCB2004_CLK, 20, 4, YHCB2004_MOSI, YHCB2004_MISO); // CLK, cols, rows, MOSI, MISO
+
 #else
 
   // Standard direct-connected LCD implementations
@@ -471,7 +475,6 @@ void MarlinUI::clear_lcd() { lcd.clear(); }
       // Show the Marlin logo and short build version
       // After a delay show the website URL
       //
-      extern const char NUL_STR[];
       logo_lines(NUL_STR);
       CENTER_OR_SCROLL(SHORT_BUILD_VERSION, 1500);
       CENTER_OR_SCROLL(MARLIN_WEBSITE_URL, 1500);
@@ -506,32 +509,26 @@ FORCE_INLINE void _draw_axis_value(const AxisEnum axis, const char *value, const
   lcd_put_wchar('X' + uint8_t(axis));
   if (blink)
     lcd_put_u8str(value);
-  else {
-    if (!TEST(axis_homed, axis))
-      while (const char c = *value++) lcd_put_wchar(c <= '.' ? c : '?');
-    else {
-      #if NONE(HOME_AFTER_DEACTIVATE, DISABLE_REDUCED_ACCURACY_WARNING)
-        if (!TEST(axis_known_position, axis))
-          lcd_put_u8str_P(axis == Z_AXIS ? PSTR("       ") : PSTR("    "));
-        else
-      #endif
-          lcd_put_u8str(value);
-    }
-  }
+  else if (axis_should_home(axis))
+    while (const char c = *value++) lcd_put_wchar(c <= '.' ? c : '?');
+  else if (NONE(HOME_AFTER_DEACTIVATE, DISABLE_REDUCED_ACCURACY_WARNING) && !axis_is_trusted(axis))
+    lcd_put_u8str_P(axis == Z_AXIS ? PSTR("       ") : PSTR("    "));
+  else
+    lcd_put_u8str(value);
 }
 
 FORCE_INLINE void _draw_heater_status(const heater_id_t heater_id, const char prefix, const bool blink) {
   #if HAS_HEATED_BED
     const bool isBed = TERN(HAS_HEATED_CHAMBER, heater_id == H_BED, heater_id < 0);
-    const float t1 = (isBed ? thermalManager.degBed()       : thermalManager.degHotend(heater_id)),
-                t2 = (isBed ? thermalManager.degTargetBed() : thermalManager.degTargetHotend(heater_id));
+    const celsius_t t1 = (isBed ? thermalManager.degBed()       : thermalManager.degHotend(heater_id)),
+                    t2 = (isBed ? thermalManager.degTargetBed() : thermalManager.degTargetHotend(heater_id));
   #else
-    const float t1 = thermalManager.degHotend(heater_id), t2 = thermalManager.degTargetHotend(heater_id);
+    const celsius_t t1 = thermalManager.degHotend(heater_id), t2 = thermalManager.degTargetHotend(heater_id);
   #endif
 
   if (prefix >= 0) lcd_put_wchar(prefix);
 
-  lcd_put_u8str(i16tostr3rj(t1 + 0.5));
+  lcd_put_u8str(i16tostr3rj(t1));
   lcd_put_wchar('/');
 
   #if !HEATER_IDLE_HANDLER
@@ -544,7 +541,7 @@ FORCE_INLINE void _draw_heater_status(const heater_id_t heater_id, const char pr
     }
     else
   #endif
-      lcd_put_u8str(i16tostr3left(t2 + 0.5));
+      lcd_put_u8str(i16tostr3left(t2));
 
   if (prefix >= 0) {
     lcd_put_wchar(LCD_STR_DEGREE[0]);
@@ -574,9 +571,9 @@ FORCE_INLINE void _draw_bed_status(const bool blink) {
 #if ENABLED(LCD_PROGRESS_BAR)
 
   void MarlinUI::draw_progress_bar(const uint8_t percent) {
-    const int16_t tix = (int16_t)(percent * (LCD_WIDTH) * 3) / 100,
-              cel = tix / 3,
-              rem = tix % 3;
+    const int16_t tix = int16_t(percent * (LCD_WIDTH) * 3) / 100,
+                  cel = tix / 3,
+                  rem = tix % 3;
     uint8_t i = LCD_WIDTH;
     char msg[LCD_WIDTH + 1], b = ' ';
     msg[LCD_WIDTH] = '\0';
@@ -706,6 +703,35 @@ void MarlinUI::draw_status_message(const bool blink) {
  *  |B000/000°  SD---%   |
  *  |01234567890123456789|
  */
+
+inline uint8_t draw_elapsed_or_remaining_time(uint8_t timepos, const bool blink) {
+  char buffer[14];
+
+  #if ENABLED(SHOW_REMAINING_TIME)
+    const bool show_remain = TERN1(ROTATE_PROGRESS_DISPLAY, blink) && (printingIsActive() || marlin_state == MF_SD_COMPLETE);
+    if (show_remain) {
+      #if ENABLED(USE_M73_REMAINING_TIME)
+        duration_t remaining = ui.get_remaining_time();
+      #else
+        uint8_t progress = ui.get_progress_percent();
+        uint32_t elapsed = print_job_timer.duration();
+        duration_t remaining = (progress > 0) ? ((elapsed * 25600 / progress) >> 8) - elapsed : 0;
+      #endif
+      timepos -= remaining.toDigital(buffer);
+      lcd_put_wchar(timepos, 2, 'R');
+    }
+  #else
+    constexpr bool show_remain = false;
+  #endif
+
+  if (!show_remain) {
+    duration_t elapsed = print_job_timer.duration();
+    timepos -= elapsed.toDigital(buffer);
+    lcd_put_wchar(timepos, 2, LCD_STR_CLOCK[0]);
+  }
+  lcd_put_u8str(buffer);
+  return timepos;
+}
 
 void MarlinUI::draw_status_screen() {
 
@@ -845,33 +871,7 @@ void MarlinUI::draw_status_screen() {
       lcd_put_u8str(i16tostr3rj(feedrate_percentage));
       lcd_put_wchar('%');
 
-      char buffer[14];
-      uint8_t timepos = 0;
-      #if ENABLED(SHOW_REMAINING_TIME)
-        const bool show_remain = TERN1(ROTATE_PROGRESS_DISPLAY, blink) && (printingIsActive() || marlin_state == MF_SD_COMPLETE);
-        if (show_remain) {
-          #if ENABLED(USE_M73_REMAINING_TIME)
-            duration_t remaining = get_remaining_time();
-          #else
-            uint8_t progress = get_progress_percent();
-            uint32_t elapsed = print_job_timer.duration();
-            duration_t remaining = (progress > 0) ? ((elapsed * 25600 / progress) >> 8) - elapsed : 0;
-          #endif
-          const uint8_t len = remaining.toDigital(buffer);
-          timepos = LCD_WIDTH - 1 - len;
-          lcd_put_wchar(timepos, 2, 'R');
-        }
-      #else
-        constexpr bool show_remain = false;
-      #endif
-
-      if (!show_remain) {
-        duration_t elapsed = print_job_timer.duration();
-        const uint8_t len = elapsed.toDigital(buffer);
-        timepos = LCD_WIDTH - 1 - len;
-        lcd_put_wchar(timepos, 2, LCD_STR_CLOCK[0]);
-      }
-      lcd_put_u8str(buffer);
+      const uint8_t timepos = draw_elapsed_or_remaining_time(LCD_WIDTH - 1, blink);
 
       #if LCD_WIDTH >= 20
         lcd_moveto(timepos - 7, 2);
@@ -955,7 +955,7 @@ void MarlinUI::draw_status_screen() {
     #elif HAS_MULTI_HOTEND && HAS_HEATED_BED
       _draw_bed_status(blink);
     #elif HAS_PRINT_PROGRESS
-      #define DREW_PRINT_PROGRESS
+      #define DREW_PRINT_PROGRESS 1
       _draw_print_progress();
     #endif
 
@@ -963,14 +963,15 @@ void MarlinUI::draw_status_screen() {
     // Elapsed Time or SD Percent
     //
     lcd_moveto(LCD_WIDTH - 9, 2);
-    #if HAS_PRINT_PROGRESS && !defined(DREW_PRINT_PROGRESS)
+
+    #if HAS_PRINT_PROGRESS && !DREW_PRINT_PROGRESS
+
       _draw_print_progress();
+
     #else
-      duration_t elapsed = print_job_timer.duration();
-      char buffer[14];
-      (void)elapsed.toDigital(buffer);
-      lcd_put_wchar(LCD_STR_CLOCK[0]);
-      lcd_put_u8str(buffer);
+
+      (void)draw_elapsed_or_remaining_time(LCD_WIDTH - 4, blink);
+
     #endif
 
   #endif // LCD_INFO_SCREEN_STYLE 1
